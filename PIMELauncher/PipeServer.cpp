@@ -22,6 +22,7 @@
 #include <ShlObj.h>
 #include <Shellapi.h>
 #include <Lmcons.h> // for UNLEN
+#include <iostream>
 #include <cstring>
 #include <cassert>
 #include <string>
@@ -30,6 +31,7 @@
 #include <fstream>
 #include <algorithm>
 #include <json/json.h>
+
 
 using namespace std;
 
@@ -164,26 +166,20 @@ void PipeServer::initSecurityAttributes() {
 
 // References:
 // https://msdn.microsoft.com/en-us/library/windows/desktop/aa365588(v=vs.85).aspx
-HANDLE PipeServer::createPipe(const wchar_t* app_name) {
-	HANDLE pipe = INVALID_HANDLE_VALUE;
-	wchar_t username[UNLEN + 1];
+HANDLE PipeServer::createPipe(const char* app_name) {
+	char username[UNLEN + 1];
 	DWORD unlen = UNLEN + 1;
-	if (GetUserNameW(username, &unlen)) {
+	if (GetUserNameA(username, &unlen)) {
 		// add username to the pipe path so it will not clash with other users' pipes.
-		wchar_t pipe_name[MAX_PATH];
-		wsprintf(pipe_name, L"\\\\.\\pipe\\%s\\PIME\\%s", username, app_name);
-		const size_t buffer_size = 1024;
+		char pipe_name[MAX_PATH];
+		sprintf(pipe_name, "\\\\.\\pipe\\%s\\PIME\\%s", username, app_name);
 		// create the pipe
-		pipe = CreateNamedPipeW(pipe_name,
-			PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-			PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-			PIPE_UNLIMITED_INSTANCES,
-			buffer_size,
-			buffer_size,
-			NMPWAIT_USE_DEFAULT_WAIT,
-			&securityAttributes_);
+		// uv_pipe_init_windows_named_pipe(uv_default_loop(), &serverPipe_, 0, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE, &securityAttributes_);
+		uv_pipe_init_windows_named_pipe(uv_default_loop(), &serverPipe_, 0, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE, &securityAttributes_);
+		serverPipe_.data = this;
+		uv_pipe_bind(&serverPipe_, pipe_name);
 	}
-	return pipe;
+	return 0;
 }
 
 void PipeServer::closePipe(HANDLE pipe) {
@@ -194,7 +190,7 @@ void PipeServer::closePipe(HANDLE pipe) {
 
 
 HANDLE PipeServer::acceptClientPipe() {
-	HANDLE client_pipe = createPipe(L"Launcher");
+	HANDLE client_pipe = createPipe("Launcher");
 	if (client_pipe != INVALID_HANDLE_VALUE) {
 		if (ConnectNamedPipe(client_pipe, &connectPipeOverlapped_)) {
 			// connection to client succeded without blocking (the event is signaled)
@@ -221,6 +217,39 @@ HANDLE PipeServer::acceptClientPipe() {
 	return client_pipe;
 }
 
+void PipeServer::onNewClientConnected(uv_stream_t* server, int status) {
+	auto client = new ClientInfo{this};
+	uv_pipe_init_windows_named_pipe(uv_default_loop(), &client->pipe_, 0, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE, &securityAttributes_);
+	client->pipe_.data = client;
+	uv_accept(server, (uv_stream_t*)&client->pipe_);
+	uv_stream_set_blocking((uv_stream_t*)&client->pipe_, 0);
+	cerr << "client connected:" << client << endl;
+
+	uv_read_start((uv_stream_t*)&client->pipe_,
+		[](uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+			buf->base = (char*)malloc(suggested_size);
+			buf->len = suggested_size;
+		},
+		[](uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+			auto client = (ClientInfo*)stream->data;
+			client->server_->onClientDataReceived(stream, nread, buf);
+		}
+	);
+}
+
+void PipeServer::onClientDataReceived(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+	auto client = (ClientInfo*)stream->data;
+	if (nread < 0 || nread == UV_EOF) {
+		OutputDebugStringA("Error!");
+		if (buf->base) {
+			free(buf->base);
+		}
+	}
+	cerr << buf->base << endl;
+	string str{buf->base, buf->len};
+	handleClientMessage(client, str.c_str());
+	free(buf->base);
+}
 
 int PipeServer::exec(LPSTR cmd) {
 	parseCommandLine(cmd);
@@ -251,6 +280,20 @@ int PipeServer::exec(LPSTR cmd) {
 
 	// preparing for the server pipe
 	initSecurityAttributes();
+
+	// initialize the server pipe
+	createPipe("Launcher");
+
+	// listen to events
+	uv_listen(reinterpret_cast<uv_stream_t*>(&serverPipe_), 32, [](uv_stream_t* server, int status) {
+		PipeServer* _this = (PipeServer*)server->data;
+		_this->onNewClientConnected(server, status);
+	});
+	OutputDebugString(L"HERE");
+	// run the main loop
+	uv_run(uv_default_loop(), UV_RUN_DEFAULT);
+
+#if 0
 	// notification for new incoming connections
 	memset(&connectPipeOverlapped_, 0, sizeof(connectPipeOverlapped_));
 	// event used to notify new incoming pipe connections
@@ -303,77 +346,28 @@ int PipeServer::exec(LPSTR cmd) {
 			break;
 		}
 	}
+#endif
 	return 0;
 }
 
-void PipeServer::readClient(const shared_ptr<ClientInfo>& client) {
-	AsyncRequest* req = new AsyncRequest(this, client, AsyncRequest::ASYNC_READ, 1024, nullptr);
-	ReadFileEx(client->pipe_, req->buf_.get(), req->bufSize_, (OVERLAPPED*)req, &_onFinishedCallback);
-}
 
-void PipeServer::writeClient(const shared_ptr<ClientInfo>& client, const char* data, int len) {
-	AsyncRequest* req = new AsyncRequest(this, client, AsyncRequest::ASYNC_WRITE, len, data);
-	WriteFileEx(client->pipe_, req->buf_.get(), req->bufSize_, (OVERLAPPED*)req, &_onFinishedCallback);
-}
-
-// static
-void CALLBACK PipeServer::_onFinishedCallback(DWORD err, DWORD numBytes, OVERLAPPED* overlapped) {
-	AsyncRequest* req = reinterpret_cast<AsyncRequest*>(overlapped);
-	req->errCode_ = err;
-	req->numBytes_ = numBytes;
-	req->server_->finishedRequests_.push(req);
-}
-
-void PipeServer::onReadFinished(AsyncRequest* req) {
-	auto client = req->client_.lock();
-	if (!client)
-		return;
-	if (req->numBytes_ > 0) {
-		client->readBuf_.append(req->buf_.get(), req->numBytes_);
-	}
-
-	switch (req->errCode_) {
-	case 0: // finish of this message
-		// TODO: call the backend to handle the message
-		handleClientMessage(client);
-		break;
-	case ERROR_MORE_DATA: // need further reads to get the whole message
-		readClient(client);
-		break;
-	case ERROR_IO_PENDING:
-		break;
-	default: // the pipe is broken, disconnect!
-		closeClient(client);
-	}
-}
-
-
-void PipeServer::onWriteFinished(AsyncRequest* req) {
-	auto client = req->client_.lock();
-	if (!client)
-		return;
-	if (req->errCode_ != 0) { // errors
-		closeClient(client);
-		return;
-	}
-	readClient(client);  // read more data from this client
-}
-
-void PipeServer::handleClientMessage(const shared_ptr<ClientInfo>& client) {
+void PipeServer::handleClientMessage(ClientInfo* client, const char* readBuf) {
 	// special handling, asked for quitting PIMELauncher.
-	if (client->readBuf_ == "quit") {
+	if (strcmp("quit", readBuf) == 0) {
 		quit();
 		return;
 	}
 
+	OutputDebugString(L"RECV COMMAND\n");
 	// call the backend to handle this message
 	if (client->backend_ == nullptr) {
 		// backend is unknown, parse the json
 		Json::Value msg;
 		Json::Reader reader;
-		if (reader.parse(client->readBuf_, msg)) {
+		if (reader.parse(readBuf, msg)) {
 			const char* method = msg["method"].asCString();
 			if (method != nullptr) {
+				OutputDebugStringA(method);
 				if (strcmp(method, "init") == 0) {  // the client connects to us the first time
 					const char* guid = msg["id"].asCString();
 					client->backend_ = BackendServer::fromLangProfileGuid(guid);
@@ -387,20 +381,27 @@ void PipeServer::handleClientMessage(const shared_ptr<ClientInfo>& client) {
 		}
 		if (client->backend_ == nullptr) {
 			// fail to find a usable backend
-			client->readBuf_.clear();
 			// FIXME: write some response to indicate the failure
 			return;
 		}
 	}
 	// pass the incoming message to the backend and get the response
-	std::string response = client->backend_->handleClientMessage(client->clientId_, client->readBuf_);
-	client->readBuf_.clear();
+	std::string response = client->backend_->handleClientMessage(client->clientId_, readBuf);
+	OutputDebugString(L"RESPONSE\n");
 
 	// pass the response back to the client
-	writeClient(client, response.c_str(), response.length());
+	uv_buf_t bufs[] = {
+		{ response.length(), (char*)response.c_str()}
+	};
+	uv_write_t* req = new uv_write_t{};
+	uv_write(req, client->stream(), bufs, 1, [](uv_write_t* req, int status) {
+		//OutputDebugString(L"RESPONSE DONE!\n");
+		delete req;
+	});
 }
 
-void PipeServer::closeClient(const shared_ptr<ClientInfo>& client) {
+void PipeServer::closeClient(ClientInfo* client) {
+/*
 	if (client->backend_ != nullptr) {
 		if (!client->clientId_.empty()) {
 			client->backend_->removeClient(client->clientId_);
@@ -411,6 +412,7 @@ void PipeServer::closeClient(const shared_ptr<ClientInfo>& client) {
 	clients_.erase(client->pipe_);
 	if (client->pipe_ != INVALID_HANDLE_VALUE)
 		::CloseHandle(client->pipe_);
+*/
 }
 
 } // namespace PIME

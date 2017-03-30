@@ -34,59 +34,28 @@
 #include <memory>
 #include "BackendServer.h"
 
+#include <uv.h>
+
 
 namespace PIME {
 
+class PipeServer;
+
 struct ClientInfo {
-	HANDLE pipe_;
 	BackendServer* backend_;
 	std::string textServiceGuid_;
 	std::string clientId_;
-
-	std::string readBuf_;
-
-	ClientInfo(HANDLE pipe) :
-		pipe_(pipe),
-		backend_(nullptr) {
-	}
-};
-
-
-class PipeServer;
-
-struct AsyncRequest {
-	enum Type {
-		ASYNC_READ,
-		ASYNC_WRITE
-	};
-
-	OVERLAPPED overlapped_;
+	uv_pipe_t pipe_;
 	PipeServer* server_;
-	std::weak_ptr<ClientInfo>  client_;
-	Type type_;
-	std::unique_ptr<char[]> buf_;
-	int bufSize_;
-	DWORD errCode_;
-	DWORD numBytes_;
-	bool success_;
 
-	AsyncRequest(PipeServer* server, const std::shared_ptr<ClientInfo>& client, Type type, int bufSize, const char* bufContent = nullptr) :
-		server_(server),
-		client_(client),
-		type_(type),
-		buf_(new char[bufSize]),
-		bufSize_(bufSize),
-		errCode_(0),
-		numBytes_(0),
-		success_(false) {
-		memset(&overlapped_, 0, sizeof(OVERLAPPED));
-		if (bufContent != nullptr) {
-			memcpy(buf_.get(), bufContent, bufSize);
-		}
+	ClientInfo(PipeServer* server) :
+		backend_(nullptr), server_{server} {
 	}
 
-	~AsyncRequest() {
+	uv_stream_t* stream() {
+		return reinterpret_cast<uv_stream_t*>(&pipe_);
 	}
+
 };
 
 
@@ -103,27 +72,23 @@ public:
 
 	void quit();
 
-	void readClient(const std::shared_ptr<ClientInfo>& client);
-	void writeClient(const std::shared_ptr<ClientInfo>& client, const char* data, int len);
-	void closeClient(const std::shared_ptr<ClientInfo>& client);
-
 private:
 	static std::string getPipeName(const char* base_name);
 	void initSecurityAttributes();
 	HANDLE acceptClientPipe();
-	HANDLE createPipe(const wchar_t * app_name);
+	HANDLE createPipe(const char * app_name);
 	void closePipe(HANDLE pipe);
 	void terminateExistingLauncher();
 	void parseCommandLine(LPSTR cmd);
 	// bool launchBackendByName(const char* name);
 
-	static void CALLBACK _onFinishedCallback(DWORD err, DWORD numBytes, OVERLAPPED* overlapped);
+	void onNewClientConnected(uv_stream_t* server, int status);
 
-	void onReadFinished(AsyncRequest* req);
+	void onClientDataReceived(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf);
 
-	void onWriteFinished(AsyncRequest* req);
+	void handleClientMessage(ClientInfo* client, const char* readBuf);
 
-	void handleClientMessage(const std::shared_ptr<ClientInfo>& client);
+	void closeClient(ClientInfo* client);
 
 private:
 	// security attribute stuff for creating the server pipe
@@ -140,8 +105,8 @@ private:
 	std::wstring topDirPath_;
 	bool quitExistingLauncher_;
 	static PipeServer* singleton_;
-	std::unordered_map<HANDLE, std::shared_ptr<ClientInfo>> clients_;
-	std::queue<AsyncRequest*> finishedRequests_;
+	// std::unordered_map<HANDLE, std::shared_ptr<ClientInfo>> clients_;
+	uv_pipe_t serverPipe_;
 };
 
 } // namespace PIME
